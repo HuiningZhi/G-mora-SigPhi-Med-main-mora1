@@ -13,7 +13,6 @@ class MOELoRATrainer(LLaVATrainer):
     扩展的 Trainer，支持：
     1. 在每次前向传播前将 task_ids 设置到 MLP 层
     2. 使用 safetensors 格式分片保存（model-*. safetensors）
-    3. 打印 gate_up_proj 和 down_proj 的独立专家权重
     """
     
     def __init__(self, *args, **kwargs):
@@ -274,7 +273,7 @@ class MOELoRATrainer(LLaVATrainer):
     def _print_current_step_weights(self, llm, task_ids, answer_types, step):
         """
         打印当前 step 的门控权重（不累积，只看当前值）
-        ✅ 分别打印 gate_up_proj 和 down_proj 的专家权重
+        ✅ 始终打印 OPEN 和 CLOSED 的权重，不管当前 batch 是否包含
         
         Args:
             llm:  语言模型
@@ -282,14 +281,14 @@ class MOELoRATrainer(LLaVATrainer):
             answer_types: 当前 batch 的 answer_types
             step: 当前 step 编号
         """
-        if llm is None or not hasattr(llm, 'model'):
+        if llm is None or not hasattr(llm, 'global_task_gate'):
             return
         
         sys.stdout.flush()
         
-        print(f"\n{'='*100}")
+        print(f"\n{'='*80}")
         print(f"📊 GATE STATISTICS - Step {step}")
-        print(f"{'='*100}")
+        print(f"{'='*80}")
         
         # ✅ 统计当前 batch 的样本分布（仅用于显示）
         if isinstance(task_ids, torch.Tensor):
@@ -300,105 +299,62 @@ class MOELoRATrainer(LLaVATrainer):
         open_count = sum(1 for tid in task_ids_list if tid == 0)
         closed_count = sum(1 for tid in task_ids_list if tid == 1)
         
-        print(f"Current batch:  {open_count} OPEN samples, {closed_count} CLOSED samples\n")
-        
-        # ✅ 获取第一层的 gate_up_proj 和 down_proj
-        layer_0 = llm.model.layers[0]
-        if not hasattr(layer_0, 'mlp'):
-            print("❌ Layer 0 has no mlp")
-            return
-        
-        mlp = layer_0.mlp
-        gate_up_proj = mlp.gate_up_proj
-        down_proj = mlp.down_proj
-        
-        from src.MLoRA.peft.tuners.mmoeloraS import MMOELoraLinearS
-        
-        # 检查是否是 MMOELoraLinearS
-        if not isinstance(gate_up_proj, MMOELoraLinearS) or not isinstance(down_proj, MMOELoraLinearS):
-            print("⚠️ gate_up_proj or down_proj is not MMOELoraLinearS")
-            return
+        print(f"Current batch:  {open_count} OPEN samples, {closed_count} CLOSED samples")
         
         # ✅ 始终打印 OPEN 和 CLOSED 的权重
         task_mapping = {0: 'OPEN', 1: 'CLOSED'}
+        gate_device = next(llm.global_task_gate. parameters()).device
         
         with torch.no_grad():
             for task_id, task_name in task_mapping.items():
+                # ✅ 获取这个任务的门控权重（当前时刻的值）
+                task_tensor = torch.tensor([task_id], dtype=torch.long, device=gate_device)
+                expert_weights = llm.global_task_gate(task_tensor)
+                weights = expert_weights[0].cpu().numpy()
+                
+                # 找到最大权重的专家
+                max_expert = weights.argmax()
+                max_weight = weights[max_expert]
+                
+                # 计算专门化程度
+                entropy = -np.sum(weights * np.log(weights + 1e-10))
+                max_entropy = -np.log(1.0 / len(weights))
+                specialization = 1 - (entropy / max_entropy)
+                
                 # ✅ 统计当前 batch 中这个任务的样本数（如果有的话）
                 count_in_batch = sum(1 for tid in task_ids_list if tid == task_id)
                 batch_info = f" (n={count_in_batch} in current batch)" if count_in_batch > 0 else " (not in current batch)"
                 
-                print(f"{'='*100}")
-                print(f"🎯 {task_name.upper()}{batch_info}:")
-                print('='*100)
+                print(f"\n🎯 {task_name}{batch_info}:")
+                print(f"   Gate Weights:  {weights}")
+                print(f"   Most Selected: Expert {max_expert} ({max_weight:.2%})")
                 
-                # ========== Gate A (gate_up_proj) 的权重 ==========
-                weights_a = gate_up_proj._last_expert_weights
-                if weights_a is not None:
-                    max_expert_a = weights_a.argmax()
-                    max_weight_a = weights_a[max_expert_a]
-                    
-                    entropy_a = -np.sum(weights_a * np.log(weights_a + 1e-10))
-                    max_entropy = -np.log(1.0 / len(weights_a))
-                    specialization_a = 1 - (entropy_a / max_entropy)
-                    
-                    print(f"\n  🚪 Gate A (gate_up_proj) 专家权重:")
-                    print(f"     [{', '.join([f'{w:.4f}' for w in weights_a])}]")
-                    print(f"     最强专家: Expert {max_expert_a} ({max_weight_a:.2%})")
-                    
-                    # 可视化
-                    for i, weight in enumerate(weights_a):
-                        bar = "█" * int(weight * 40)
-                        marker = " ⭐" if i == max_expert_a else ""
-                        print(f"       Expert {i}: {weight:.4f} |{bar:<40}|{marker}")
-                    
-                    print(f"     专门化程度: {specialization_a:.2%}")
-                else:
-                    print(f"  ⚠️ Gate A (gate_up_proj): No weights recorded (forward not called)")
-                    weights_a = None
+                # 可视化
+                for i, weight in enumerate(weights):
+                    bar = "█" * int(weight * 40)
+                    marker = " ⭐" if i == max_expert else ""
+                    print(f"     Expert {i}:  {weight:.4f} |{bar: <40}|{marker}")
                 
-                # ========== Gate B (down_proj) 的权重 ==========
-                weights_b = down_proj._last_expert_weights
-                if weights_b is not None:
-                    max_expert_b = weights_b.argmax()
-                    max_weight_b = weights_b[max_expert_b]
-                    
-                    entropy_b = -np.sum(weights_b * np.log(weights_b + 1e-10))
-                    max_entropy = -np.log(1.0 / len(weights_b))
-                    specialization_b = 1 - (entropy_b / max_entropy)
-                    
-                    print(f"\n  🚪 Gate B (down_proj) 专家权重:")
-                    print(f"     [{', '.join([f'{w:.4f}' for w in weights_b])}]")
-                    print(f"     最强专家: Expert {max_expert_b} ({max_weight_b:.2%})")
-                    
-                    # 可视化
-                    for i, weight in enumerate(weights_b):
-                        bar = "█" * int(weight * 40)
-                        marker = " ⭐" if i == max_expert_b else ""
-                        print(f"       Expert {i}: {weight:.4f} |{bar:<40}|{marker}")
-                    
-                    print(f"     专门化程度: {specialization_b:.2%}")
-                else:
-                    print(f"  ⚠️ Gate B (down_proj): No weights recorded (forward not called)")
-                    weights_b = None
-                
-                # ========== Gate A vs Gate B 对比 ==========
-                if weights_a is not None and weights_b is not None:
-                    print(f"\n  📊 Gate A vs Gate B 对比:")
-                    print(f"     权重相同: {np.allclose(weights_a, weights_b)}")
-                    
-                    if not np.allclose(weights_a, weights_b):
-                        diff = weights_a - weights_b
-                        print(f"     差异: [{', '.join([f'{d:+.4f}' for d in diff])}]")
-                        print(f"     最大差异: {np.abs(diff).max():.6f}")
-                        print(f"     平均差异: {np.abs(diff).mean():.6f}")
-                    
-                    if max_expert_a == max_expert_b:
-                        print(f"     最强专家: ✅ 都选 Expert {max_expert_a}")
-                    else:
-                        print(f"     最强专家: ❌ Gate A 选 Expert {max_expert_a}, Gate B 选 Expert {max_expert_b}")
-                
-                print()
+                print(f"   Specialization:  {specialization:.2%}")
         
-        print(f"{'='*100}\n")
+        # 对比 OPEN 和 CLOSED（当前时刻的值）
+        print(f"\n📊 Comparison:")
+        with torch.no_grad():
+            open_tensor = torch.tensor([0], dtype=torch.long, device=gate_device)
+            closed_tensor = torch.tensor([1], dtype=torch.long, device=gate_device)
+            
+            open_weights = llm.global_task_gate(open_tensor)[0].cpu().numpy()
+            closed_weights = llm.global_task_gate(closed_tensor)[0].cpu().numpy()
+            
+            open_max = open_weights.argmax()
+            closed_max = closed_weights.argmax()
+            
+            print(f"   OPEN   → Expert {open_max} ({open_weights[open_max]:.2%})")
+            print(f"   CLOSED → Expert {closed_max} ({closed_weights[closed_max]:.2%})")
+            
+            # 计算权重分布的差异
+            diff = np.abs(open_weights - closed_weights).sum()
+            print(f"   Difference: {diff:.4f}")
+        
+        print(f"{'='*80}\n")
         sys.stdout.flush()
